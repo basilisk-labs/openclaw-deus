@@ -96,14 +96,23 @@ export default (): DeusConfig => ({
     fallbackToDirect:
       (process.env.LLM_FALLBACK_TO_DIRECT || "true") !== "false",
     gatewayUrl:
+      process.env.OPENCLAW_INFERENCE_GATEWAY_URL ||
       process.env.OPENCLAW_GATEWAY_URL ||
       process.env.OPENCLOW_GATEWAY_URL ||
       "",
-    gatewayPath: process.env.OPENCLAW_GATEWAY_PATH || "/inference/complete",
+    gatewayPath:
+      process.env.OPENCLAW_INFERENCE_GATEWAY_PATH ||
+      process.env.OPENCLAW_GATEWAY_PATH ||
+      "/inference/complete",
     gatewayApiKey:
-      process.env.OPENCLAW_API_KEY || process.env.OPENCLOW_API_KEY || "",
+      process.env.OPENCLAW_INFERENCE_GATEWAY_TOKEN ||
+      process.env.OPENCLAW_API_KEY ||
+      process.env.OPENCLOW_API_KEY ||
+      "",
     gatewayTimeoutMs: parseInt(
-      process.env.OPENCLAW_GATEWAY_TIMEOUT_MS || "15000",
+      process.env.OPENCLAW_INFERENCE_GATEWAY_TIMEOUT_MS ||
+        process.env.OPENCLAW_GATEWAY_TIMEOUT_MS ||
+        "15000",
       10,
     ),
   },

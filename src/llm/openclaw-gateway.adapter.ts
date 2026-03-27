@@ -64,6 +64,7 @@ export class OpenClawGatewayAdapter implements LLMPort {
 
   private headers(callId?: string): Record<string, string> {
     const apiKey =
+      process.env.OPENCLAW_INFERENCE_GATEWAY_TOKEN ||
       process.env.OPENCLAW_API_KEY ||
       process.env.OPENCLAW_GATEWAY_TOKEN ||
       process.env.OPENCLOW_API_KEY;
@@ -78,6 +79,7 @@ export class OpenClawGatewayAdapter implements LLMPort {
 
   private baseUrl(): string {
     return (
+      process.env.OPENCLAW_INFERENCE_GATEWAY_URL ||
       process.env.OPENCLAW_GATEWAY_URL ||
       process.env.OPENCLOW_GATEWAY_URL ||
       ""
@@ -85,10 +87,19 @@ export class OpenClawGatewayAdapter implements LLMPort {
   }
 
   private path(): string {
-    return process.env.OPENCLAW_GATEWAY_PATH || "/inference/complete";
+    return (
+      process.env.OPENCLAW_INFERENCE_GATEWAY_PATH ||
+      process.env.OPENCLAW_GATEWAY_PATH ||
+      "/inference/complete"
+    );
   }
 
   private timeoutMs(): number {
-    return parseInt(process.env.OPENCLAW_GATEWAY_TIMEOUT_MS || "15000", 10);
+    return parseInt(
+      process.env.OPENCLAW_INFERENCE_GATEWAY_TIMEOUT_MS ||
+        process.env.OPENCLAW_GATEWAY_TIMEOUT_MS ||
+        "15000",
+      10,
+    );
   }
 }

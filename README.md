@@ -53,9 +53,9 @@ LLM_MODE=direct
 
 # Route inference through OpenClaw without moving cognition into OpenClaw
 LLM_MODE=openclaw
-OPENCLAW_GATEWAY_URL=http://127.0.0.1:18080
-OPENCLAW_GATEWAY_PATH=/inference/complete
-OPENCLAW_GATEWAY_TOKEN=...
+OPENCLAW_INFERENCE_GATEWAY_URL=http://127.0.0.1:18080
+OPENCLAW_INFERENCE_GATEWAY_PATH=/inference/complete
+OPENCLAW_INFERENCE_GATEWAY_TOKEN=...
 ```
 
 Direct-mode fallback can remain enabled in gateway mode:
