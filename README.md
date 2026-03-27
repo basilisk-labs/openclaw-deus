@@ -32,8 +32,43 @@ npx ts-node src/training/childhood.ts 500
 npx ts-node src/training/multi-world.ts 500
 
 # Tests
-npm test   # 568+ tests, 45+ suites
+npm test   # 617+ tests, 55+ suites
 ```
+
+## LLM Integration
+
+LLM execution is transport-decoupled from cognition:
+
+- `LlmDecisionPolicyService` stays inside DEUS and decides whether a call is needed, what kind of call it is, and what budget/model intent to assign.
+- `LLMPort` is the only inference boundary for cognition services.
+- `DirectLLMAdapter` talks to the provider directly.
+- `OpenClawGatewayAdapter` forwards the same structured request to the OpenClaw inference gateway.
+- `LlmClientService` remains the compatibility facade that applies budget, energy, cache, fallback, and observability policy.
+
+Supported modes:
+
+```bash
+# Default: direct provider mode
+LLM_MODE=direct
+
+# Route inference through OpenClaw without moving cognition into OpenClaw
+LLM_MODE=openclaw
+OPENCLAW_GATEWAY_URL=http://127.0.0.1:8080
+OPENCLAW_GATEWAY_PATH=/inference/complete
+OPENCLAW_API_KEY=...
+```
+
+Direct-mode fallback can remain enabled in gateway mode:
+
+```bash
+LLM_FALLBACK_TO_DIRECT=true
+```
+
+Important boundary:
+
+- DEUS decides when to call the LLM, builds context, and sets budget/model intent.
+- OpenClaw is transport and governance only.
+- Provider calls must stay inside adapters; cognition services use `LLMPort`, not provider SDKs.
 
 ## Architecture
 
@@ -91,7 +126,7 @@ Prediction:    1.0
 
 ```
 200+ files, ~25,000 lines TypeScript
-45+ test suites, 568+ tests
+55+ test suites, 617+ tests
 22 NestJS modules
 18 SurrealDB migrations, 4 stored procedures, MTREE vector index
 57+ database tables (including cluster, belongs_to, cluster_trajectory)

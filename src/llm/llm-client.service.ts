@@ -1,212 +1,299 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Result, ok, err } from 'neverthrow';
-import { DomainError } from '../common/types/result.types';
-import { LlmCallOptions, LlmCallResult, LlmOperationType, LlmPriority } from './types/llm.types';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
+import { randomUUID } from 'node:crypto';
+import { Result, ok, err, DomainError } from '../common/types/result.types';
+import { EnergyService } from '../kernel/energy.service';
 import { LlmBudgetService } from './llm-budget.service';
 import { LlmCacheService } from './llm-cache.service';
-import Anthropic from '@anthropic-ai/sdk';
-
-export class LlmError extends DomainError {
-  readonly code = 'LLM_ERROR';
-}
-
-export class LlmBudgetExhaustedError extends DomainError {
-  readonly code = 'LLM_BUDGET_EXHAUSTED';
-}
-
-const RETRY_DELAYS = [0, 1000, 4000, 16000];
-const RETRYABLE_STATUSES = [429, 500, 529];
+import { LlmDecisionPolicyService } from './llm-decision-policy.service';
+import { LlmCallOptions, LlmCallResult, LlmOperationType, LlmPriority } from './types/llm.types';
+import { DIRECT_LLM_ADAPTER, OPENCLOW_GATEWAY_ADAPTER } from './llm-port.token';
+import { LlmBudgetExhaustedError, LlmError } from './llm.errors';
+import { LlmObservabilityService } from './llm-observability.service';
+import { LLMPort, LLMRequest, LLMResponse } from './types/llm-port.types';
 
 @Injectable()
-export class LlmClientService {
+export class LlmClientService implements LLMPort, OnModuleInit {
   private readonly logger = new Logger(LlmClientService.name);
-  private client: Anthropic | null = null;
-  private concurrency = 0;
-  private maxConcurrency: number;
-  private queue: Array<{ resolve: () => void; priority: LlmPriority }> = [];
   private paused = false;
+  private energyService?: EnergyService | null;
 
   constructor(
+    @Inject(DIRECT_LLM_ADAPTER) private readonly directAdapter: LLMPort,
+    @Inject(OPENCLOW_GATEWAY_ADAPTER) private readonly openclawAdapter: LLMPort,
     private readonly budget: LlmBudgetService,
     private readonly cache: LlmCacheService,
-  ) {
-    const apiKey = process.env.LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
-    this.maxConcurrency = parseInt(process.env.LLM_MAX_CONCURRENCY || '2', 10);
-    if (apiKey) {
-      this.client = new Anthropic({ apiKey });
-    }
+    private readonly decisions: LlmDecisionPolicyService,
+    private readonly observability: LlmObservabilityService,
+    private readonly moduleRef: ModuleRef,
+  ) {}
+
+  async onModuleInit(): Promise<void> {
+    await this.budget.loadToday();
   }
 
   isAvailable(): boolean {
-    return this.client !== null && !this.paused;
+    return !this.paused && this.primaryAdapter().isAvailable();
   }
 
-  /** Pause LLM calls (training mode — no tokens spent). */
-  pause(): void { this.paused = true; }
+  pause(): void {
+    this.paused = true;
+  }
 
-  /** Resume LLM calls (production mode). */
-  resume(): void { this.paused = false; }
+  resume(): void {
+    this.paused = false;
+  }
+
+  async complete(request: LLMRequest): Promise<Result<LLMResponse, DomainError>> {
+    const callId = request.call_id || randomUUID();
+    const normalizedRequest = { ...request, call_id: callId };
+
+    if (this.paused) {
+      const error = new LlmError('LLM paused (training mode)');
+      await this.recordFailure(normalizedRequest, error, this.mode(), false);
+      return err(error);
+    }
+
+    const cached = this.readCache(normalizedRequest);
+    if (cached) {
+      await this.observability.record({
+        call_id: callId,
+        trace_id: normalizedRequest.trace_id,
+        request_type: normalizedRequest.request_type,
+        reason: normalizedRequest.reason,
+        priority: normalizedRequest.priority,
+        budget_class: normalizedRequest.budget_class,
+        provider: cached.provider,
+        model: cached.model,
+        latency_ms: 0,
+        token_usage: cached.usage,
+        mode: this.mode(),
+        cached: true,
+        success: true,
+      });
+      return ok(cached);
+    }
+
+    const gated = this.applyExecutionGuards(normalizedRequest);
+    if (gated.isErr()) {
+      await this.recordFailure(normalizedRequest, gated.error, this.mode(), false);
+      return err(gated.error);
+    }
+
+    const effectiveRequest = gated.value;
+    let mode = this.mode();
+    let result = await this.primaryAdapter().complete(effectiveRequest);
+    let fallbackUsed = false;
+
+    if (result.isErr() && this.shouldFallbackToDirect()) {
+      this.logger.warn(`Gateway mode failed, falling back to direct adapter: ${result.error.message}`);
+      mode = 'direct';
+      fallbackUsed = true;
+      result = await this.directAdapter.complete(effectiveRequest);
+    }
+
+    if (result.isErr()) {
+      await this.recordFailure(effectiveRequest, result.error, mode, fallbackUsed);
+      return err(result.error);
+    }
+
+    await this.recordUsage(result.value, effectiveRequest);
+    this.writeCache(effectiveRequest, result.value);
+    await this.observability.record({
+      call_id: callId,
+      trace_id: effectiveRequest.trace_id,
+      request_type: effectiveRequest.request_type,
+      reason: effectiveRequest.reason,
+      priority: effectiveRequest.priority,
+      budget_class: effectiveRequest.budget_class,
+      provider: result.value.provider,
+      model: result.value.model,
+      latency_ms: result.value.latency_ms,
+      token_usage: result.value.usage,
+      mode,
+      cached: result.value.cached,
+      success: true,
+      fallback_used: fallbackUsed,
+    });
+
+    return ok(result.value);
+  }
 
   async call<T = unknown>(options: LlmCallOptions): Promise<Result<LlmCallResult<T>, DomainError>> {
-    // Check cache
-    if (options.cacheKey) {
-      const cached = this.cache.get<T>(options.cacheKey);
-      if (cached !== null) {
-        return ok({
-          data: cached,
-          usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 },
-          latencyMs: 0,
-          cached: true,
-          operationType: options.operationType,
-        });
-      }
+    const request = this.decisions.buildRequest({
+      operationType: options.operationType,
+      reason: 'legacy_call',
+      priorityOverride: this.decisions.mapLegacyPriority(options.priority),
+      context: {
+        input: options.userMessage,
+      },
+      prompt: {
+        system_prompt: options.systemPrompt,
+        user_message: options.userMessage,
+        tools: options.tools,
+        force_tool: options.forceTool,
+      },
+      maxTokens: options.maxTokens,
+      cacheKey: options.cacheKey,
+      cacheTtlMs: options.cacheTtlMs,
+    });
+
+    const result = await this.complete(request);
+    if (result.isErr()) {
+      return err(result.error);
     }
 
-    // Check availability
-    if (!this.client || this.paused) {
-      return err(new LlmError(this.paused ? 'LLM paused (training mode)' : 'LLM client not available — API key not configured'));
-    }
-
-    // Check budget
-    const estimatedInput = options.systemPrompt.length / 4 + options.userMessage.length / 4;
-    const estimatedOutput = options.maxTokens;
-    if (!this.budget.canAfford(estimatedInput, estimatedOutput, options.priority)) {
-      return err(new LlmBudgetExhaustedError('Daily LLM token budget exhausted'));
-    }
-
-    // Concurrency control
-    await this.acquireSlot(options.priority);
-
-    try {
-      const start = Date.now();
-      const result = await this.callWithRetry(options);
-      const latencyMs = Date.now() - start;
-
-      if (result.isErr()) return err(result.error);
-
-      const { data, usage } = result.value;
-
-      // Record budget
-      await this.budget.record(
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_tokens || 0,
-        options.operationType,
-      );
-
-      // Cache result
-      if (options.cacheKey) {
-        this.cache.set(options.cacheKey, data, options.operationType);
-      }
-
-      this.logger.log(
-        `LLM ${options.operationType}: ${usage.input_tokens}in/${usage.output_tokens}out, ${latencyMs}ms`,
-      );
-
-      return ok({
-        data: data as T,
-        usage,
-        latencyMs,
-        cached: false,
-        operationType: options.operationType,
-      });
-    } finally {
-      this.releaseSlot();
-    }
-  }
-
-  private async callWithRetry(
-    options: LlmCallOptions,
-  ): Promise<Result<{ data: unknown; usage: { input_tokens: number; output_tokens: number; cache_read_tokens: number } }, DomainError>> {
-    const maxRetries = options.priority === LlmPriority.CRITICAL ? 4 : 3;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt] || 16000));
-      }
-
-      try {
-        const tools = options.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          input_schema: t.input_schema as Anthropic.Tool.InputSchema,
-        }));
-
-        const response = await this.client!.messages.create({
-          model: process.env.LLM_MODEL || 'claude-haiku-4-5-20251001',
-          max_tokens: options.maxTokens,
-          system: [{
-            type: 'text' as const,
-            text: options.systemPrompt,
-            cache_control: { type: 'ephemeral' as const },
-          }],
-          messages: [{ role: 'user', content: options.userMessage }],
-          tools,
-          tool_choice: options.forceTool
-            ? { type: 'tool' as const, name: options.forceTool }
-            : { type: 'auto' as const },
-        });
-
-        // Extract tool_use result
-        const toolUse = response.content.find((c) => c.type === 'tool_use');
-        const data = toolUse && 'input' in toolUse ? toolUse.input : null;
-
-        if (!data) {
-          // Fallback: try to extract from text
-          const textBlock = response.content.find((c) => c.type === 'text');
-          const text = textBlock && 'text' in textBlock ? textBlock.text : '';
-          try {
-            const jsonMatch = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
-            return ok({
-              data: jsonMatch ? JSON.parse(jsonMatch[0]) : {},
-              usage: {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-                cache_read_tokens: (response.usage as unknown as Record<string, unknown>).cache_read_input_tokens as number || 0, // Anthropic extended usage field
-              },
-            });
-          } catch {
-            return err(new LlmError('No structured output from LLM'));
-          }
-        }
-
-        return ok({
-          data,
-          usage: {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            cache_read_tokens: (response.usage as unknown as Record<string, unknown>).cache_read_input_tokens as number || 0, // Anthropic extended usage field
-          },
-        });
-      } catch (error: any) {
-        if (error?.status && RETRYABLE_STATUSES.includes(error.status) && attempt < maxRetries - 1) {
-          this.logger.warn(`LLM retry ${attempt + 1}: ${error.status}`);
-          continue;
-        }
-        return err(new LlmError(`LLM call failed: ${error?.message || error}`));
-      }
-    }
-
-    return err(new LlmError('LLM call failed after all retries'));
-  }
-
-  private async acquireSlot(priority: LlmPriority): Promise<void> {
-    if (this.concurrency < this.maxConcurrency) {
-      this.concurrency++;
-      return;
-    }
-    // Wait for a slot
-    return new Promise((resolve) => {
-      this.queue.push({ resolve: () => { this.concurrency++; resolve(); }, priority });
-      this.queue.sort((a, b) => a.priority - b.priority);
+    return ok({
+      data: (result.value.output_data ?? this.parseOutput(result.value.output_text)) as T,
+      usage: {
+        input_tokens: result.value.usage?.prompt_tokens || 0,
+        output_tokens: result.value.usage?.completion_tokens || 0,
+        cache_read_tokens: result.value.usage?.cache_read_tokens || 0,
+      },
+      latencyMs: result.value.latency_ms || 0,
+      cached: result.value.cached || false,
+      operationType: options.operationType,
     });
   }
 
-  private releaseSlot(): void {
-    this.concurrency--;
-    if (this.queue.length > 0) {
-      const next = this.queue.shift()!;
-      next.resolve();
+  private applyExecutionGuards(request: LLMRequest): Result<LLMRequest, DomainError> {
+    const estimatedInput = (request.prompt.system_prompt.length + request.prompt.user_message.length) / 4;
+    const estimatedOutput = request.max_tokens || 1024;
+    const budgetBypassed = request.priority === 'high' && request.budget_class === 'expensive_allowed';
+
+    if (!budgetBypassed && !this.budget.canAfford(
+      estimatedInput,
+      estimatedOutput,
+      this.toLegacyPriority(request.priority),
+    )) {
+      return err(new LlmBudgetExhaustedError('Daily LLM token budget exhausted'));
+    }
+
+    const energy = this.getEnergyService();
+    if (!energy) {
+      return ok(request);
+    }
+
+    const currentEnergy = energy.getState().current;
+    if (!energy.canAffordLlm() && request.priority !== 'high') {
+      return err(new LlmError('LLM skipped: insufficient cognitive energy'));
+    }
+
+    if (currentEnergy < 0.2 && request.model_preference === 'reasoning') {
+      return ok({ ...request, model_preference: 'fast' });
+    }
+
+    if (currentEnergy < 0.35 && request.model_preference === 'balanced') {
+      return ok({ ...request, model_preference: 'fast' });
+    }
+
+    return ok(request);
+  }
+
+  private readCache(request: LLMRequest): LLMResponse | null {
+    if (!request.cache?.key) {
+      return null;
+    }
+
+    return this.cache.get<LLMResponse>(request.cache.key);
+  }
+
+  private writeCache(request: LLMRequest, response: LLMResponse): void {
+    const operationType = request.metadata?.operation_type;
+    if (!request.cache?.key || typeof operationType !== 'string') {
+      return;
+    }
+
+    this.cache.set(
+      request.cache.key,
+      { ...response, cached: true },
+      operationType as LlmOperationType,
+    );
+  }
+
+  private async recordUsage(response: LLMResponse, request: LLMRequest): Promise<void> {
+    const operationType = request.metadata?.operation_type;
+    if (typeof operationType !== 'string' || !response.usage) {
+      return;
+    }
+
+    await this.budget.record(
+      response.usage.prompt_tokens,
+      response.usage.completion_tokens,
+      response.usage.cache_read_tokens || 0,
+      operationType as LlmOperationType,
+    );
+  }
+
+  private async recordFailure(
+    request: LLMRequest,
+    error: DomainError,
+    mode: 'direct' | 'openclaw',
+    fallbackUsed: boolean,
+  ): Promise<void> {
+    await this.observability.record({
+      call_id: request.call_id || randomUUID(),
+      trace_id: request.trace_id,
+      request_type: request.request_type,
+      reason: request.reason,
+      priority: request.priority,
+      budget_class: request.budget_class,
+      mode,
+      success: false,
+      fallback_used: fallbackUsed,
+      error_code: error.code,
+      error_message: error.message,
+    });
+  }
+
+  private primaryAdapter(): LLMPort {
+    return this.mode() === 'openclaw' ? this.openclawAdapter : this.directAdapter;
+  }
+
+  private shouldFallbackToDirect(): boolean {
+    return this.mode() === 'openclaw'
+      && (process.env.LLM_FALLBACK_TO_DIRECT || 'true') !== 'false'
+      && this.directAdapter.isAvailable();
+  }
+
+  private mode(): 'direct' | 'openclaw' {
+    return process.env.LLM_MODE === 'openclaw' ? 'openclaw' : 'direct';
+  }
+
+  private toLegacyPriority(priority: LLMRequest['priority']): LlmPriority {
+    switch (priority) {
+      case 'high':
+        return LlmPriority.CRITICAL;
+      case 'medium':
+        return LlmPriority.NORMAL;
+      case 'low':
+      default:
+        return LlmPriority.LOW;
+    }
+  }
+
+  private getEnergyService(): EnergyService | null {
+    if (this.energyService !== undefined) {
+      return this.energyService;
+    }
+
+    try {
+      this.energyService = this.moduleRef.get(EnergyService, { strict: false });
+    } catch {
+      this.energyService = null;
+    }
+
+    return this.energyService;
+  }
+
+  private parseOutput(text: string): unknown {
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+      return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    } catch {
+      return {};
     }
   }
 }
+
+export { LlmError, LlmBudgetExhaustedError } from './llm.errors';

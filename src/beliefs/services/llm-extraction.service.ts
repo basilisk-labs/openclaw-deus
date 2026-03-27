@@ -1,8 +1,11 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Result, ok, err } from 'neverthrow';
-import { DomainError, ExtractionError } from '../../common/types/result.types';
-import { ExtractionCandidate } from '../../common/types/belief.types';
-import Anthropic from '@anthropic-ai/sdk';
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Result, ok, err } from "neverthrow";
+import { DomainError, ExtractionError } from "../../common/types/result.types";
+import { ExtractionCandidate } from "../../common/types/belief.types";
+import { LLM_PORT } from "../../llm/llm-port.token";
+import { LlmDecisionPolicyService } from "../../llm/llm-decision-policy.service";
+import { LLMPort } from "../../llm/types/llm-port.types";
+import { LlmOperationType } from "../../llm/types/llm.types";
 
 const EXTRACTION_PROMPT = `Analyze the following text and extract belief candidates. A belief is a statement about user preferences, requirements, constraints, or observations that should be remembered.
 
@@ -22,37 +25,57 @@ Return ONLY a valid JSON array. If no beliefs found, return [].`;
 @Injectable()
 export class LlmExtractionService {
   private readonly logger = new Logger(LlmExtractionService.name);
-  private client: Anthropic | null = null;
 
-  constructor() {
-    const apiKey = process.env.LLM_API_KEY;
-    if (apiKey && process.env.LLM_ENABLED === 'true') {
-      this.client = new Anthropic({ apiKey });
-    }
-  }
+  constructor(
+    @Inject(LLM_PORT) private readonly llm: LLMPort,
+    private readonly llmDecision: LlmDecisionPolicyService,
+  ) {}
 
   isAvailable(): boolean {
-    return this.client !== null;
+    return this.llm.isAvailable();
   }
 
-  async extractCandidates(content: string, source: string): Promise<Result<ExtractionCandidate[], DomainError>> {
-    if (!this.client) {
-      return err(new ExtractionError('LLM extraction not available — LLM_ENABLED=false or LLM_API_KEY not set'));
+  async extractCandidates(
+    content: string,
+    source: string,
+  ): Promise<Result<ExtractionCandidate[], DomainError>> {
+    if (!this.llm.isAvailable()) {
+      return err(
+        new ExtractionError(
+          "LLM extraction not available — LLM_ENABLED=false or LLM_API_KEY not set",
+        ),
+      );
     }
 
     try {
-      const response = await this.client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: [{
-          role: 'user',
-          content: EXTRACTION_PROMPT.replace('{TEXT}', content.slice(0, 4000)),
-        }],
-      });
+      const response = await this.llm.complete(
+        this.llmDecision.buildRequest({
+          operationType: LlmOperationType.BELIEF_EXTRACTION,
+          reason: "memory_pattern_extraction",
+          priorityOverride: "medium",
+          context: {
+            input: content,
+          },
+          prompt: {
+            system_prompt:
+              "You extract belief candidates from text and return structured JSON.",
+            user_message: EXTRACTION_PROMPT.replace(
+              "{TEXT}",
+              content.slice(0, 4000),
+            ),
+          },
+          maxTokens: 1024,
+        }),
+      );
+      if (response.isErr()) {
+        return err(new ExtractionError(response.error.message));
+      }
 
-      const text = response.content[0].type === 'text' ? response.content[0].text : '';
+      const text = response.value.output_text;
       const candidates = this.parseResponse(text, source);
-      this.logger.log(`LLM extracted ${candidates.length} candidates from ${source}`);
+      this.logger.log(
+        `LLM extracted ${candidates.length} candidates from ${source}`,
+      );
       return ok(candidates);
     } catch (error) {
       this.logger.error(`LLM extraction failed: ${error}`);
@@ -78,14 +101,14 @@ export class LlmExtractionService {
         .map((item) => ({
           content: item.content,
           confidence: Math.min(1, Math.max(0, item.confidence)),
-          category: item.category || 'operational',
-          prefix: item.category === 'communication' ? 'M' : 'W',
-          type: 'llm_extraction',
-          autoPromote: item.autoPromote ?? (item.confidence > 0.8),
+          category: item.category || "operational",
+          prefix: item.category === "communication" ? "M" : "W",
+          type: "llm_extraction",
+          autoPromote: item.autoPromote ?? item.confidence > 0.8,
           provenance: `llm_${source}`,
         }));
     } catch {
-      this.logger.warn('Failed to parse LLM extraction response');
+      this.logger.warn("Failed to parse LLM extraction response");
       return [];
     }
   }

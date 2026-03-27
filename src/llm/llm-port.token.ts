@@ -1,0 +1,4 @@
+export const LLM_PORT = Symbol('LLM_PORT');
+
+export const DIRECT_LLM_ADAPTER = Symbol('DIRECT_LLM_ADAPTER');
+export const OPENCLOW_GATEWAY_ADAPTER = Symbol('OPENCLOW_GATEWAY_ADAPTER');

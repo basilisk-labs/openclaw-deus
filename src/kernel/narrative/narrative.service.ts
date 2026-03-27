@@ -1,12 +1,14 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Result, ok, err } from 'neverthrow';
-import { DomainError } from '../../common/types/result.types';
-import { SurrealService } from '../../database/surreal.service';
-import { LlmClientService } from '../../llm/llm-client.service';
-import { LlmOperationType, LlmPriority } from '../../llm/types/llm.types';
-import { CommitDelta, NarrativeFrame, TimeSense } from '../kernel.types';
-import { CommitKernelService } from '../commit/commit-kernel.service';
-import { AffectiveStateService } from '../affect/affective-state.service';
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Result, ok, err } from "neverthrow";
+import { DomainError } from "../../common/types/result.types";
+import { SurrealService } from "../../database/surreal.service";
+import { LLM_PORT } from "../../llm/llm-port.token";
+import { LlmDecisionPolicyService } from "../../llm/llm-decision-policy.service";
+import { LLMPort } from "../../llm/types/llm-port.types";
+import { LlmOperationType, LlmPriority } from "../../llm/types/llm.types";
+import { CommitDelta, NarrativeFrame, TimeSense } from "../kernel.types";
+import { CommitKernelService } from "../commit/commit-kernel.service";
+import { AffectiveStateService } from "../affect/affective-state.service";
 
 /**
  * NarrativeService: Post-hoc temporal storytelling + commit log compaction.
@@ -18,18 +20,33 @@ import { AffectiveStateService } from '../affect/affective-state.service';
  */
 
 const NARRATE_TOOL = {
-  name: 'narrate',
-  description: 'Generate temporal narrative from cognitive state',
+  name: "narrate",
+  description: "Generate temporal narrative from cognitive state",
   input_schema: {
-    type: 'object' as const,
+    type: "object" as const,
     properties: {
-      timeframe: { type: 'string' as const },
-      summary: { type: 'string' as const },
-      temporal_quality: { type: 'string' as const, enum: ['dragged', 'flew_by', 'felt_important', 'routine', 'intense'] },
-      key_events: { type: 'array' as const, items: { type: 'string' as const } },
-      unresolved: { type: 'array' as const, items: { type: 'string' as const } },
+      timeframe: { type: "string" as const },
+      summary: { type: "string" as const },
+      temporal_quality: {
+        type: "string" as const,
+        enum: ["dragged", "flew_by", "felt_important", "routine", "intense"],
+      },
+      key_events: {
+        type: "array" as const,
+        items: { type: "string" as const },
+      },
+      unresolved: {
+        type: "array" as const,
+        items: { type: "string" as const },
+      },
     },
-    required: ['timeframe', 'summary', 'temporal_quality', 'key_events', 'unresolved'],
+    required: [
+      "timeframe",
+      "summary",
+      "temporal_quality",
+      "key_events",
+      "unresolved",
+    ],
   },
 };
 
@@ -44,7 +61,8 @@ export class NarrativeService {
 
   constructor(
     private readonly db: SurrealService,
-    private readonly llm: LlmClientService,
+    @Inject(LLM_PORT) private readonly llm: LLMPort,
+    private readonly llmDecision: LlmDecisionPolicyService,
     private readonly commitKernel: CommitKernelService,
     private readonly affect: AffectiveStateService,
   ) {}
@@ -53,19 +71,23 @@ export class NarrativeService {
    * Compact old commits into narrative frames.
    * Commits outside attention window → summarized → deleted from commit_log.
    */
-  async compact(): Promise<Result<{ compacted: number; frames_created: number }, DomainError>> {
+  async compact(): Promise<
+    Result<{ compacted: number; frames_created: number }, DomainError>
+  > {
     // Get all commits outside attention window
     const windowResult = await this.commitKernel.getAttentionWindow();
     if (windowResult.isErr()) return err(windowResult.error);
 
-    const inWindow = new Set(windowResult.value.map(c => c.commit_id));
+    const inWindow = new Set(windowResult.value.map((c) => c.commit_id));
 
     const allResult = await this.db.query<CommitDelta>(
-      'SELECT * FROM commit_log ORDER BY cycle ASC',
+      "SELECT * FROM commit_log ORDER BY cycle ASC",
     );
     if (allResult.isErr()) return err(allResult.error);
 
-    const outsideWindow = allResult.value.filter(c => !inWindow.has(c.commit_id));
+    const outsideWindow = allResult.value.filter(
+      (c) => !inWindow.has(c.commit_id),
+    );
     if (outsideWindow.length < 10) {
       return ok({ compacted: 0, frames_created: 0 }); // not enough to compact
     }
@@ -80,7 +102,10 @@ export class NarrativeService {
     for (const chunk of chunks) {
       const frame = await this.compactChunk(chunk);
       if (frame) {
-        await this.db.create('narrative_frame', frame as unknown as Record<string, unknown>);
+        await this.db.create(
+          "narrative_frame",
+          frame as unknown as Record<string, unknown>,
+        );
         // Delete compacted commits
         for (const c of chunk) {
           if (c.id) await this.db.remove(c.id);
@@ -89,15 +114,22 @@ export class NarrativeService {
       }
     }
 
-    this.logger.log(`Compacted ${outsideWindow.length} commits into ${framesCreated} narrative frames`);
-    return ok({ compacted: outsideWindow.length, frames_created: framesCreated });
+    this.logger.log(
+      `Compacted ${outsideWindow.length} commits into ${framesCreated} narrative frames`,
+    );
+    return ok({
+      compacted: outsideWindow.length,
+      frames_created: framesCreated,
+    });
   }
 
   /**
    * Compress a chunk of commits into a NarrativeFrame.
    * Uses LLM if available, otherwise rule-based.
    */
-  private async compactChunk(commits: CommitDelta[]): Promise<NarrativeFrame | null> {
+  private async compactChunk(
+    commits: CommitDelta[],
+  ): Promise<NarrativeFrame | null> {
     if (commits.length === 0) return null;
 
     const cycleRange = `cycles ${commits[0].cycle}-${commits[commits.length - 1].cycle}`;
@@ -118,41 +150,66 @@ export class NarrativeService {
 
     // Determine temporal quality from dynamics
     let temporalQuality: string;
-    if (avgNovelty > 0.6 && avgPredError > 0.3) temporalQuality = 'intense';
-    else if (avgNovelty > 0.5) temporalQuality = 'dragged'; // lots of novelty = felt long
-    else if (avgNovelty < 0.2 && avgPredError < 0.1) temporalQuality = 'flew_by'; // routine
-    else if (escalations > commits.length * 0.3) temporalQuality = 'felt_important';
-    else temporalQuality = 'routine';
+    if (avgNovelty > 0.6 && avgPredError > 0.3) temporalQuality = "intense";
+    else if (avgNovelty > 0.5)
+      temporalQuality = "dragged"; // lots of novelty = felt long
+    else if (avgNovelty < 0.2 && avgPredError < 0.1)
+      temporalQuality = "flew_by"; // routine
+    else if (escalations > commits.length * 0.3)
+      temporalQuality = "felt_important";
+    else temporalQuality = "routine";
 
     // Key events: highest-energy commits
     const keyEvents = commits
       .sort((a, b) => b.energy - a.energy)
       .slice(0, 5)
-      .map(c => `[${c.type}] ${c.source_agents.join('+')} (energy=${c.energy})`);
+      .map(
+        (c) => `[${c.type}] ${c.source_agents.join("+")} (energy=${c.energy})`,
+      );
 
     // Try LLM narrative
     if (this.llm.isAvailable()) {
       try {
-        const result = await this.llm.call<NarrativeFrame>({
-          operationType: LlmOperationType.SELF_ASSESSMENT,
-          priority: LlmPriority.LOW,
-          maxTokens: 512,
-          systemPrompt: SYSTEM_PROMPT,
-          userMessage: `Period: ${cycleRange}\nCommits: ${commits.length}\nTypes: ${JSON.stringify(Object.fromEntries(commitTypes))}\nAvg novelty: ${avgNovelty.toFixed(2)}\nAvg pred error: ${avgPredError.toFixed(2)}\nEscalations: ${escalations}\nKey events:\n${keyEvents.join('\n')}`,
-          tools: [NARRATE_TOOL],
-          forceTool: 'narrate',
-        });
+        const result = await this.llm.complete(
+          this.llmDecision.buildRequest({
+            operationType: LlmOperationType.SELF_ASSESSMENT,
+            reason: "temporal_self_narration",
+            priorityOverride: "low",
+            context: {
+              recent_commits: commits,
+              world_snapshot: {
+                avg_novelty: avgNovelty,
+                avg_prediction_error: avgPredError,
+                escalations,
+              },
+            },
+            prompt: {
+              system_prompt: SYSTEM_PROMPT,
+              user_message: `Period: ${cycleRange}\nCommits: ${commits.length}\nTypes: ${JSON.stringify(Object.fromEntries(commitTypes))}\nAvg novelty: ${avgNovelty.toFixed(2)}\nAvg pred error: ${avgPredError.toFixed(2)}\nEscalations: ${escalations}\nKey events:\n${keyEvents.join("\n")}`,
+              tools: [NARRATE_TOOL],
+              force_tool: "narrate",
+            },
+            maxTokens: 512,
+          }),
+        );
 
         if (result.isOk()) {
-          return result.value.data;
+          const frame = result.value.output_data as NarrativeFrame;
+          if (frame?.summary) {
+            return frame;
+          }
         }
-      } catch { /* fallback below */ }
+      } catch {
+        /* fallback below */
+      }
     }
 
     // Rule-based fallback
     return {
       timeframe: cycleRange,
-      summary: `${commits.length} commits: ${Array.from(commitTypes.entries()).map(([t, c]) => `${c} ${t}`).join(', ')}`,
+      summary: `${commits.length} commits: ${Array.from(commitTypes.entries())
+        .map(([t, c]) => `${c} ${t}`)
+        .join(", ")}`,
       temporal_quality: temporalQuality,
       key_events: keyEvents,
       unresolved: [],
@@ -170,9 +227,9 @@ export class NarrativeService {
     const commits = recentCommits.isOk() ? recentCommits.value : [];
     if (commits.length === 0) {
       return ok({
-        timeframe: 'current',
-        summary: 'Nothing in awareness. System resting.',
-        temporal_quality: 'routine',
+        timeframe: "current",
+        summary: "Nothing in awareness. System resting.",
+        temporal_quality: "routine",
         key_events: [],
         unresolved: [],
       });
@@ -181,19 +238,29 @@ export class NarrativeService {
     // Build narrative from commit dynamics
     const frame = await this.compactChunk(commits);
     if (!frame) {
-      return ok({ timeframe: 'current', summary: 'Minimal activity.', temporal_quality: 'routine', key_events: [], unresolved: [] });
+      return ok({
+        timeframe: "current",
+        summary: "Minimal activity.",
+        temporal_quality: "routine",
+        key_events: [],
+        unresolved: [],
+      });
     }
 
     // Enrich with affect
     frame.timeframe = `current (dilation=${timeSense.dilation}, mode=${affectSnapshot.mode})`;
     if (affectSnapshot.pain.intensity > 0.3) {
-      frame.unresolved.push(`Pain: ${affectSnapshot.pain.source} (${affectSnapshot.pain.chronic ? 'chronic' : 'acute'})`);
+      frame.unresolved.push(
+        `Pain: ${affectSnapshot.pain.source} (${affectSnapshot.pain.chronic ? "chronic" : "acute"})`,
+      );
     }
 
     return ok(frame);
   }
 
-  async getRecentFrames(limit = 10): Promise<Result<NarrativeFrame[], DomainError>> {
+  async getRecentFrames(
+    limit = 10,
+  ): Promise<Result<NarrativeFrame[], DomainError>> {
     return this.db.query<NarrativeFrame>(
       `SELECT * FROM narrative_frame ORDER BY timeframe DESC LIMIT $limit`,
       { limit },
