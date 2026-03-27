@@ -63,7 +63,10 @@ export class OpenClawGatewayAdapter implements LLMPort {
   }
 
   private headers(callId?: string): Record<string, string> {
-    const apiKey = process.env.OPENCLAW_API_KEY || process.env.OPENCLOW_API_KEY;
+    const apiKey =
+      process.env.OPENCLAW_API_KEY ||
+      process.env.OPENCLAW_GATEWAY_TOKEN ||
+      process.env.OPENCLOW_API_KEY;
     return {
       "content-type": "application/json",
       ...(apiKey
