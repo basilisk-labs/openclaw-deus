@@ -1,15 +1,15 @@
-import { Test, TestingModule } from '@nestjs/testing';
-import { BootstrapService } from './bootstrap.service';
-import { SurrealService } from '../database/surreal.service';
-import { ok, err } from 'neverthrow';
-import { DatabaseError } from '../common/types/result.types';
-import * as fs from 'fs';
-import * as path from 'path';
+import { Test, TestingModule } from "@nestjs/testing";
+import { BootstrapService } from "./bootstrap.service";
+import { SurrealService } from "../database/surreal.service";
+import { ok, err } from "neverthrow";
+import { DatabaseError } from "../common/types/result.types";
+import * as fs from "fs";
+import * as path from "path";
 
-jest.mock('fs');
+jest.mock("fs");
 const mockFs = fs as jest.Mocked<typeof fs>;
 
-describe('BootstrapService', () => {
+describe("BootstrapService", () => {
   let service: BootstrapService;
   let db: jest.Mocked<SurrealService>;
 
@@ -33,62 +33,108 @@ describe('BootstrapService', () => {
     db = module.get(SurrealService);
   });
 
-  describe('validate', () => {
-    it('should check all 5 identity files', async () => {
+  describe("validate", () => {
+    it("should check all 5 identity files", async () => {
       mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue('{"belief_id":"I1","content":"test","confidence":1}\n');
+      mockFs.readFileSync.mockReturnValue(
+        '{"belief_id":"I1","content":"test","confidence":1}\n',
+      );
 
-      const result = await service.validate('/fake/root');
+      const result = await service.validate("/fake/root");
       expect(result.isOk()).toBe(true);
       const report = result._unsafeUnwrap();
 
-      const identityChecks = report.checks.filter((c) => c.name.startsWith('identity:'));
+      const identityChecks = report.checks.filter((c) =>
+        c.name.startsWith("identity:"),
+      );
       expect(identityChecks).toHaveLength(5);
       expect(identityChecks.every((c) => c.ok)).toBe(true);
     });
 
-    it('should fail when identity files are missing', async () => {
+    it("should fail when identity files are missing", async () => {
       mockFs.existsSync.mockReturnValue(false);
 
-      const result = await service.validate('/fake/root');
+      const result = await service.validate("/fake/root");
       expect(result.isOk()).toBe(true);
       const report = result._unsafeUnwrap();
       expect(report.allPassed).toBe(false);
     });
 
-    it('should check database connectivity', async () => {
+    it("should check database connectivity", async () => {
       mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue('{"belief_id":"I1","content":"test","confidence":1}\n');
-      db.ping.mockResolvedValue(err(new DatabaseError('unreachable')));
+      mockFs.readFileSync.mockReturnValue(
+        '{"belief_id":"I1","content":"test","confidence":1}\n',
+      );
+      db.ping.mockResolvedValue(err(new DatabaseError("unreachable")));
 
-      const result = await service.validate('/fake/root');
+      const result = await service.validate("/fake/root");
       const report = result._unsafeUnwrap();
-      const dbCheck = report.checks.find((c) => c.name === 'database:connectivity');
+      const dbCheck = report.checks.find(
+        (c) => c.name === "database:connectivity",
+      );
       expect(dbCheck!.ok).toBe(false);
     });
 
-    it('should validate core.jsonl format', async () => {
+    it("should validate core.jsonl format", async () => {
       mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue('not json\n');
+      mockFs.readFileSync.mockReturnValue("not json\n");
 
-      const result = await service.validate('/fake/root');
+      const result = await service.validate("/fake/root");
       const report = result._unsafeUnwrap();
-      const seedCheck = report.checks.find((c) => c.name === 'seed:core.jsonl');
+      const seedCheck = report.checks.find((c) => c.name === "seed:core.jsonl");
       expect(seedCheck!.ok).toBe(false);
     });
   });
 
-  describe('isSeeded', () => {
-    it('should return true when beliefs exist', async () => {
-      db.query.mockResolvedValue(ok([{ belief_id: 'I1' }] as any));
+  describe("isSeeded", () => {
+    it("should return true when beliefs exist", async () => {
+      db.query.mockResolvedValue(ok([{ belief_id: "I1" }] as any));
       const result = await service.isSeeded();
       expect(result._unsafeUnwrap()).toBe(true);
     });
 
-    it('should return false when no beliefs', async () => {
+    it("should return false when no beliefs", async () => {
       db.query.mockResolvedValue(ok([]));
       const result = await service.isSeeded();
       expect(result._unsafeUnwrap()).toBe(false);
+    });
+  });
+
+  describe("runMigrations", () => {
+    it("should fall back to src/database/migrations when dist assets are missing", async () => {
+      const srcDir = path.join(process.cwd(), "src", "database", "migrations");
+      mockFs.existsSync.mockImplementation((target) => target === srcDir);
+      mockFs.readdirSync.mockReturnValue(["001-initial-schema.surql"] as any);
+
+      const result = await service.runMigrations();
+
+      expect(result.isOk()).toBe(true);
+      expect(db.runMigration).toHaveBeenCalledWith(
+        path.join(srcDir, "001-initial-schema.surql"),
+      );
+    });
+  });
+
+  describe("ensureTablesExist", () => {
+    it("should succeed when every required table is readable", async () => {
+      db.query.mockResolvedValue(ok([]));
+
+      const result = await service.ensureTablesExist(["belief", "world_model"]);
+
+      expect(result.isOk()).toBe(true);
+      expect(db.query).toHaveBeenCalledTimes(2);
+    });
+
+    it("should fail when a required table is missing", async () => {
+      db.query.mockResolvedValueOnce(ok([]));
+      db.query.mockResolvedValueOnce(
+        err(new DatabaseError("missing diagnosis table")),
+      );
+
+      const result = await service.ensureTablesExist(["belief", "diagnosis"]);
+
+      expect(result.isErr()).toBe(true);
+      expect(result._unsafeUnwrapErr().message).toContain("diagnosis");
     });
   });
 });
