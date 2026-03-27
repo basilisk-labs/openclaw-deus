@@ -22,7 +22,7 @@ import { ExperienceModule } from "./experience/experience.module";
 import { PolicyModule } from "./policy/policy.module";
 import { WorldModelModule } from "./world-model/world-model.module";
 import { IntrospectionModule } from "./introspection/introspection.module";
-import { MetricsModule } from "./metrics/metrics.module";
+import { SidecarMetricsModule } from "./metrics/sidecar-metrics.module";
 import { HealthModule } from "./health/health.module";
 import { BootstrapModule } from "./bootstrap/bootstrap.module";
 import { AdapterModule } from "./adapter/adapter.module";
@@ -60,7 +60,7 @@ import { AdapterModule } from "./adapter/adapter.module";
     PolicyModule,
     WorldModelModule,
     IntrospectionModule,
-    MetricsModule,
+    SidecarMetricsModule,
     HealthModule,
     BootstrapModule,
     AdapterModule,
