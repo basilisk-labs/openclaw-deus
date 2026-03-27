@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, clean-install]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    env:
+      SURREAL_URL: http://localhost:8000/rpc
+      SURREAL_NS: deus_test
+      SURREAL_DB: test
+      SURREAL_USER: root
+      SURREAL_PASS: root
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Start SurrealDB
+        run: |
+          docker run -d --name surrealdb -p 8000:8000 \
+            surrealdb/surrealdb:latest \
+            start --user root --pass root --bind 0.0.0.0:8000
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "SurrealDB is ready"
+              break
+            fi
+            echo "Waiting for SurrealDB... ($i)"
+            sleep 1
+          done
+
+      - run: npm ci
+
+      - name: TypeScript compile check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test -- --ci --coverage
+
+      - name: Integration tests
+        run: npm run test:integration -- --ci --passWithNoTests
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  build:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npx tsc
+
+      - name: Build Docker image
+        run: docker build -t deus:latest .

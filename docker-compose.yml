@@ -1,0 +1,35 @@
+services:
+  deus:
+    build: .
+    ports:
+      - "3000:3000"
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    environment:
+      PORT: "3000"
+      SURREAL_URL: "http://surrealdb:8000/rpc"
+      SURREAL_NS: "deus"
+      SURREAL_DB: "runtime"
+      SURREAL_USER: "root"
+      SURREAL_PASS: "root"
+      AUTH_ENABLED: "false"
+      NIGHTLY_ENABLED: "true"
+    restart: unless-stopped
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    command: start file:///data/deus.db --user root --pass root --bind 0.0.0.0:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - surreal-data:/data
+    healthcheck:
+      test: ["CMD", "surreal", "is-ready", "--conn", "http://localhost:8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  surreal-data:

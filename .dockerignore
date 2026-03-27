@@ -1,0 +1,7 @@
+node_modules
+dist
+deus.db
+*.log
+.tmp
+coverage
+.git
