@@ -8,6 +8,8 @@
 
 # Temporary staging/imports
 .tmp/
+.tmp-*.cjs
+.tmp-*.mts
 logs/bootstrap-validation.json
 logs/openclaw-integration-test.json
 
@@ -25,6 +27,7 @@ __MACOSX/
 node_modules/
 npm-debug.log*
 dist/
+data/
 
 # Python
 __pycache__/
