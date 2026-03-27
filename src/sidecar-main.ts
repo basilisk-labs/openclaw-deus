@@ -67,6 +67,7 @@ async function bootstrap() {
   SwaggerModule.setup("api/docs", app, document);
 
   app.enableShutdownHooks();
+  await app.init();
 
   const bootstrapService = app.get(BootstrapService);
   const migrationResult = await bootstrapService.runMigrations();
