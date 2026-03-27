@@ -9,12 +9,18 @@ import {
   AdapterHealthResponse,
   AdapterImportBeliefsSnapshotRequest,
   AdapterImportCursorRecord,
+  AdapterImportIntrospectionSummaryRequest,
   AdapterImportLogBatchRequest,
+  AdapterImportMemorySnapshotRequest,
+  AdapterImportStatusSnapshotRequest,
+  AdapterIntrospectionSummaryImportResponse,
   AdapterLogBatchImportResponse,
   AdapterLogEntryRecord,
+  AdapterMemorySnapshotImportResponse,
   AdapterMetricsLatestResponse,
   AdapterReadModelState,
   AdapterSnapshotRecord,
+  AdapterStatusSnapshotImportResponse,
   AdapterWorldModelLatestResponse,
   NormalizedImportedBelief,
 } from "./adapter.types";
@@ -25,11 +31,15 @@ import {
 import { DiagnosisResult } from "../metrics/diagnosis.types";
 import { CognitiveSnapshot } from "../metrics/metrics.types";
 import { WorldModel } from "../common/types/world-model.types";
+import { IntrospectionPosture } from "../common/types/introspection.types";
 
 const ADAPTER_SERVICE_NAME = "cognitive-runtime";
 const ADAPTER_VERSION = "1";
 const LOG_CURSOR_KEY = "log-batch";
 const BELIEFS_CURSOR_KEY = "beliefs-snapshot";
+const MEMORY_CURSOR_KEY = "memory-snapshot";
+const STATUS_CURSOR_KEY = "status-snapshot";
+const INTROSPECTION_CURSOR_KEY = "introspection-summary";
 
 @Injectable()
 export class AdapterService {
@@ -42,14 +52,25 @@ export class AdapterService {
 
   async getHealth(): Promise<AdapterHealthResponse> {
     const dbConnected = this.db.isConnected();
-    const [logCursor, beliefsCursor, worldModelTs, metricsTs, diagnosisTs] =
-      await Promise.all([
-        this.readImportCursor(LOG_CURSOR_KEY),
-        this.readImportCursor(BELIEFS_CURSOR_KEY),
-        this.readLatestTimestamp("world_model", "generated_at"),
-        this.readLatestTimestamp("cognitive_snapshot", "timestamp"),
-        this.readLatestTimestamp("diagnosis", "created_at"),
-      ]);
+    const [
+      logCursor,
+      beliefsCursor,
+      memoryCursor,
+      statusCursor,
+      introspectionCursor,
+      worldModelTs,
+      metricsTs,
+      diagnosisTs,
+    ] = await Promise.all([
+      this.readImportCursor(LOG_CURSOR_KEY),
+      this.readImportCursor(BELIEFS_CURSOR_KEY),
+      this.readImportCursor(MEMORY_CURSOR_KEY),
+      this.readImportCursor(STATUS_CURSOR_KEY),
+      this.readImportCursor(INTROSPECTION_CURSOR_KEY),
+      this.readLatestTimestamp("world_model", "generated_at"),
+      this.readLatestTimestamp("cognitive_snapshot", "timestamp"),
+      this.readLatestTimestamp("diagnosis", "created_at"),
+    ]);
 
     return {
       ok: true,
@@ -64,6 +85,24 @@ export class AdapterService {
         ),
         lastBeliefSnapshotAt: this.readStringField(
           beliefsCursor?.value?.generatedAt,
+        ),
+        lastMemorySnapshotId: this.readStringField(
+          memoryCursor?.value?.snapshotId,
+        ),
+        lastMemorySnapshotAt: this.readStringField(
+          memoryCursor?.value?.generatedAt,
+        ),
+        lastStatusSnapshotId: this.readStringField(
+          statusCursor?.value?.snapshotId,
+        ),
+        lastStatusSnapshotAt: this.readStringField(
+          statusCursor?.value?.generatedAt,
+        ),
+        lastIntrospectionSnapshotId: this.readStringField(
+          introspectionCursor?.value?.snapshotId,
+        ),
+        lastIntrospectionSnapshotAt: this.readStringField(
+          introspectionCursor?.value?.generatedAt,
         ),
       },
       readModels: {
@@ -237,19 +276,254 @@ export class AdapterService {
     };
   }
 
+  async importMemorySnapshot(
+    dto: AdapterImportMemorySnapshotRequest,
+  ): Promise<AdapterMemorySnapshotImportResponse> {
+    if (!dto || typeof dto !== "object") {
+      throw new Error("Memory snapshot payload must be an object.");
+    }
+    if (!dto.snapshotId || typeof dto.snapshotId !== "string") {
+      throw new Error("Memory snapshot payload must include snapshotId.");
+    }
+    if (!Array.isArray(dto.days)) {
+      throw new Error("Memory snapshot payload must include days array.");
+    }
+
+    const importedAt = new Date().toISOString();
+    const generatedAt = this.normalizeTimestamp(dto.generatedAt, importedAt);
+    const existingSnapshot = await this.readSnapshot(dto.snapshotId);
+    if (existingSnapshot) {
+      await this.writeImportCursor(MEMORY_CURSOR_KEY, {
+        snapshotId: dto.snapshotId,
+        generatedAt,
+        dayCount: this.normalizeCount(dto.dayCount, dto.days.length),
+        latestDayKey: this.normalizeString(dto.latestDayKey),
+      });
+      return {
+        ok: true,
+        snapshotId: dto.snapshotId,
+        generatedAt,
+        dayCount: this.normalizeCount(dto.dayCount, dto.days.length),
+        latestDayKey: this.normalizeString(dto.latestDayKey),
+        deduplicated: true,
+        importedAt,
+      };
+    }
+
+    const snapshotResult = await this.db.create<AdapterSnapshotRecord>(
+      "adapter_snapshot",
+      {
+        snapshot_id: dto.snapshotId,
+        snapshot_type: "memory",
+        source_runtime: "master-runtime",
+        generated_at: generatedAt,
+        payload: {
+          day_count: this.normalizeCount(dto.dayCount, dto.days.length),
+          latest_day_key: this.normalizeString(dto.latestDayKey),
+          days: dto.days.map((day) => ({
+            day_key: this.normalizeString(day?.dayKey),
+            content: typeof day?.content === "string" ? day.content : "",
+          })),
+        },
+        imported_at: importedAt,
+      },
+    );
+    if (snapshotResult.isErr()) {
+      throw snapshotResult.error;
+    }
+
+    await this.writeImportCursor(MEMORY_CURSOR_KEY, {
+      snapshotId: dto.snapshotId,
+      generatedAt,
+      dayCount: this.normalizeCount(dto.dayCount, dto.days.length),
+      latestDayKey: this.normalizeString(dto.latestDayKey),
+    });
+
+    return {
+      ok: true,
+      snapshotId: dto.snapshotId,
+      generatedAt,
+      dayCount: this.normalizeCount(dto.dayCount, dto.days.length),
+      latestDayKey: this.normalizeString(dto.latestDayKey),
+      deduplicated: false,
+      importedAt,
+    };
+  }
+
+  async importStatusSnapshot(
+    dto: AdapterImportStatusSnapshotRequest,
+  ): Promise<AdapterStatusSnapshotImportResponse> {
+    if (!dto || typeof dto !== "object") {
+      throw new Error("Status snapshot payload must be an object.");
+    }
+    if (!dto.snapshotId || typeof dto.snapshotId !== "string") {
+      throw new Error("Status snapshot payload must include snapshotId.");
+    }
+
+    const importedAt = new Date().toISOString();
+    const generatedAt = this.normalizeTimestamp(dto.generatedAt, importedAt);
+    const existingSnapshot = await this.readSnapshot(dto.snapshotId);
+    if (existingSnapshot) {
+      await this.writeImportCursor(STATUS_CURSOR_KEY, {
+        snapshotId: dto.snapshotId,
+        generatedAt,
+      });
+      return {
+        ok: true,
+        snapshotId: dto.snapshotId,
+        generatedAt,
+        exists: dto.exists === true,
+        deduplicated: true,
+        importedAt,
+      };
+    }
+
+    const snapshotResult = await this.db.create<AdapterSnapshotRecord>(
+      "adapter_snapshot",
+      {
+        snapshot_id: dto.snapshotId,
+        snapshot_type: "status",
+        source_runtime: "master-runtime",
+        generated_at: generatedAt,
+        payload: {
+          exists: dto.exists === true,
+          focus_state: this.normalizeObject(dto.focusState),
+          flat: this.normalizeObject(dto.flat),
+          raw: typeof dto.raw === "string" ? dto.raw : "",
+        },
+        imported_at: importedAt,
+      },
+    );
+    if (snapshotResult.isErr()) {
+      throw snapshotResult.error;
+    }
+
+    await this.writeImportCursor(STATUS_CURSOR_KEY, {
+      snapshotId: dto.snapshotId,
+      generatedAt,
+    });
+
+    return {
+      ok: true,
+      snapshotId: dto.snapshotId,
+      generatedAt,
+      exists: dto.exists === true,
+      deduplicated: false,
+      importedAt,
+    };
+  }
+
+  async importIntrospectionSummary(
+    dto: AdapterImportIntrospectionSummaryRequest,
+  ): Promise<AdapterIntrospectionSummaryImportResponse> {
+    if (!dto || typeof dto !== "object") {
+      throw new Error("Introspection summary payload must be an object.");
+    }
+    if (!dto.snapshotId || typeof dto.snapshotId !== "string") {
+      throw new Error("Introspection summary payload must include snapshotId.");
+    }
+
+    const importedAt = new Date().toISOString();
+    const generatedAt = this.normalizeTimestamp(dto.generatedAt, importedAt);
+    const existingSnapshot = await this.readSnapshot(dto.snapshotId);
+    if (existingSnapshot) {
+      await this.writeImportCursor(INTROSPECTION_CURSOR_KEY, {
+        snapshotId: dto.snapshotId,
+        generatedAt,
+      });
+      return {
+        ok: true,
+        snapshotId: dto.snapshotId,
+        generatedAt,
+        exists: dto.exists === true,
+        deduplicated: true,
+        importedAt,
+      };
+    }
+
+    const summary = this.normalizeObject(dto.summary);
+    const posture = this.inferImportedPosture(summary);
+    const introspectionRecord = {
+      profile: "sleep",
+      executed_stages: ["imported_summary"],
+      coherence_score: this.normalizeNumber(summary?.coherence, 0.5),
+      posture,
+      summary: {
+        total_beliefs: this.normalizeCount(summary?.beliefs, 0),
+        active_beliefs: this.normalizeCount(summary?.beliefs, 0),
+        low_confidence_count: 0,
+        avg_confidence: 0.5,
+        contradictions_found: 0,
+        memory_freshness_days: this.deriveMemoryFreshnessDays(summary),
+        posture,
+        coherence_score: this.normalizeNumber(summary?.coherence, 0.5),
+      },
+      stage_outputs: {
+        imported_summary: summary || {},
+      },
+      generated_at: generatedAt,
+    };
+
+    const snapshotResult = await this.db.create<AdapterSnapshotRecord>(
+      "adapter_snapshot",
+      {
+        snapshot_id: dto.snapshotId,
+        snapshot_type: "introspection",
+        source_runtime: "master-runtime",
+        generated_at: generatedAt,
+        payload: {
+          exists: dto.exists === true,
+          summary: summary || {},
+        },
+        imported_at: importedAt,
+      },
+    );
+    if (snapshotResult.isErr()) {
+      throw snapshotResult.error;
+    }
+
+    const introspectionCreate = await this.db.create(
+      "introspection_report",
+      introspectionRecord,
+    );
+    if (introspectionCreate.isErr()) {
+      throw introspectionCreate.error;
+    }
+
+    await this.writeImportCursor(INTROSPECTION_CURSOR_KEY, {
+      snapshotId: dto.snapshotId,
+      generatedAt,
+    });
+
+    return {
+      ok: true,
+      snapshotId: dto.snapshotId,
+      generatedAt,
+      exists: dto.exists === true,
+      deduplicated: false,
+      importedAt,
+    };
+  }
+
   async getLatestWorldModel(): Promise<AdapterWorldModelLatestResponse> {
     let result = await this.worldModel.getLatest();
     if (result.isErr()) {
       throw result.error;
     }
-    if (!result.value) {
+    const latestImportAt = await this.readLatestAdapterImportTimestamp();
+    if (
+      !result.value ||
+      this.isReadModelStale(result.value.generated_at, latestImportAt)
+    ) {
       result = await this.worldModel.build();
       if (result.isErr()) {
         throw result.error;
       }
     }
 
-    const model = result.value as WorldModel;
+    const model = await this.enrichWorldModelFromImports(
+      result.value as WorldModel,
+    );
     return {
       ok: true,
       generatedAt: model.generated_at,
@@ -263,7 +537,11 @@ export class AdapterService {
     if (result.isErr()) {
       throw result.error;
     }
-    if (!result.value) {
+    const latestImportAt = await this.readLatestAdapterImportTimestamp();
+    if (
+      !result.value ||
+      this.isReadModelStale(result.value.timestamp, latestImportAt)
+    ) {
       result = await this.metrics.snapshot();
       if (result.isErr()) {
         throw result.error;
@@ -281,10 +559,17 @@ export class AdapterService {
 
   async getLatestDiagnosis(): Promise<AdapterDiagnosisLatestResponse> {
     let diagnosis = await this.readLatestDiagnosis();
-    if (!diagnosis) {
+    const latestImportAt = await this.readLatestAdapterImportTimestamp();
+    if (
+      !diagnosis ||
+      this.isReadModelStale(diagnosis.created_at, latestImportAt)
+    ) {
       const metrics = await this.metrics.getLatest();
       let snapshot = metrics.isOk() ? metrics.value : null;
-      if (!snapshot) {
+      if (
+        !snapshot ||
+        this.isReadModelStale(snapshot.timestamp, latestImportAt)
+      ) {
         const fresh = await this.metrics.snapshot();
         if (fresh.isErr()) {
           throw fresh.error;
@@ -304,6 +589,67 @@ export class AdapterService {
       sourceFreshnessMs: this.getFreshnessMs(diagnosis.created_at),
       diagnosis,
     };
+  }
+
+  private async enrichWorldModelFromImports(
+    model: WorldModel,
+  ): Promise<WorldModel> {
+    const enriched: WorldModel = JSON.parse(JSON.stringify(model));
+    const [memorySnapshot, statusSnapshot, introspectionSnapshot, logCount] =
+      await Promise.all([
+        this.readLatestSnapshotByType("memory"),
+        this.readLatestSnapshotByType("status"),
+        this.readLatestSnapshotByType("introspection"),
+        this.readActivityLogCount(),
+      ]);
+
+    if (memorySnapshot?.payload) {
+      const payload = this.normalizeObject(memorySnapshot.payload);
+      const dayCount = this.normalizeCount(payload?.day_count, null);
+      const latestDayKey = this.normalizeString(payload?.latest_day_key);
+      if (dayCount !== null) {
+        enriched.sources.memory.days = dayCount;
+      }
+      if (latestDayKey) {
+        enriched.sources.memory.latest_day = latestDayKey;
+        enriched.workspace_model.memory_freshness_days =
+          this.deriveDayFreshness(latestDayKey);
+      }
+    }
+
+    if (statusSnapshot?.payload) {
+      const payload = this.normalizeObject(statusSnapshot.payload);
+      const focusState = this.normalizeObject(payload?.focus_state);
+      const exists =
+        typeof payload?.exists === "boolean" ? payload.exists : true;
+      enriched.sources.status.exists = exists;
+      if (focusState) {
+        enriched.workspace_model.active_project =
+          this.normalizeString(focusState.activeProject) ||
+          enriched.workspace_model.active_project;
+        enriched.workspace_model.mode =
+          this.normalizeString(focusState.mode) ||
+          enriched.workspace_model.mode;
+        enriched.workspace_model.status =
+          this.normalizeString(focusState.status) ||
+          enriched.workspace_model.status;
+        enriched.workspace_model.next_step =
+          this.normalizeString(focusState.nextStep) ||
+          enriched.workspace_model.next_step;
+      }
+    }
+
+    if (introspectionSnapshot?.payload) {
+      const payload = this.normalizeObject(introspectionSnapshot.payload);
+      const summary = this.normalizeObject(payload?.summary);
+      enriched.workspace_model.introspection_date =
+        this.normalizeString(summary?.date) ||
+        introspectionSnapshot.generated_at ||
+        enriched.workspace_model.introspection_date;
+    }
+
+    enriched.sources.logs.entries = logCount;
+    return enriched;
   }
 
   private async readImportCursor(
@@ -381,6 +727,19 @@ export class AdapterService {
     return result.value[0] || null;
   }
 
+  private async readLatestSnapshotByType(
+    snapshotType: string,
+  ): Promise<AdapterSnapshotRecord | null> {
+    const result = await this.db.query<AdapterSnapshotRecord>(
+      "SELECT * FROM adapter_snapshot WHERE snapshot_type = $snapshotType ORDER BY imported_at DESC LIMIT 1",
+      { snapshotType },
+    );
+    if (result.isErr()) {
+      throw result.error;
+    }
+    return result.value[0] || null;
+  }
+
   private async readLatestTimestamp(
     table: string,
     field: string,
@@ -401,6 +760,47 @@ export class AdapterService {
     return null;
   }
 
+  private async readLatestAdapterImportTimestamp(): Promise<string | null> {
+    const [cursorTs, snapshotTs, logTs] = await Promise.all([
+      this.readLatestTimestamp("adapter_import_cursor", "updated_at"),
+      this.readLatestTimestamp("adapter_snapshot", "imported_at"),
+      this.readLatestTimestamp("adapter_log_entry", "imported_at"),
+    ]);
+
+    return (
+      [cursorTs, snapshotTs, logTs]
+        .filter((value): value is string => Boolean(value))
+        .sort()
+        .at(-1) || null
+    );
+  }
+
+  private async readActivityLogCount(): Promise<number> {
+    const result = await this.db.query<{ count: number }>(
+      "SELECT count() AS count FROM activity_log GROUP ALL",
+    );
+    if (result.isErr()) {
+      return 0;
+    }
+    return this.normalizeCount(result.value[0]?.count, 0);
+  }
+
+  private isReadModelStale(
+    generatedAt: string | null | undefined,
+    latestImportAt: string | null,
+  ): boolean {
+    if (!generatedAt || !latestImportAt) {
+      return false;
+    }
+    if (
+      Number.isNaN(Date.parse(generatedAt)) ||
+      Number.isNaN(Date.parse(latestImportAt))
+    ) {
+      return false;
+    }
+    return new Date(generatedAt).getTime() < new Date(latestImportAt).getTime();
+  }
+
   private getFreshnessMs(timestamp: string | null): number | null {
     if (!timestamp || Number.isNaN(Date.parse(timestamp))) {
       return null;
@@ -417,5 +817,62 @@ export class AdapterService {
 
   private readStringField(value: unknown): string | null {
     return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  private normalizeObject(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? { ...(value as Record<string, unknown>) }
+      : null;
+  }
+
+  private normalizeString(value: unknown): string | null {
+    return typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : null;
+  }
+
+  private normalizeCount(value: unknown, fallback: number | null): number {
+    const numeric =
+      typeof value === "number" ? value : Number.parseInt(String(value), 10);
+    if (Number.isFinite(numeric) && numeric >= 0) {
+      return numeric;
+    }
+    return fallback ?? 0;
+  }
+
+  private normalizeNumber(value: unknown, fallback: number): number {
+    const numeric = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  }
+
+  private inferImportedPosture(
+    summary: Record<string, unknown> | null,
+  ): IntrospectionPosture {
+    const coherence = this.normalizeNumber(summary?.coherence, 0.5);
+    if (coherence >= 0.75) {
+      return "stable";
+    }
+    if (coherence >= 0.45) {
+      return "review";
+    }
+    return "repair";
+  }
+
+  private deriveMemoryFreshnessDays(
+    summary: Record<string, unknown> | null,
+  ): number {
+    if (summary?.memory_today === true) {
+      return 0;
+    }
+    if (summary?.memory_yesterday === true) {
+      return 1;
+    }
+    return 999;
+  }
+
+  private deriveDayFreshness(dayKey: string): number {
+    const midnightUtc = new Date(`${dayKey}T00:00:00.000Z`);
+    const diffMs = Date.now() - midnightUtc.getTime();
+    return Math.max(0, Math.floor(diffMs / 86_400_000));
   }
 }

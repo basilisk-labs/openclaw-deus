@@ -11,7 +11,10 @@ import { Public } from "../auth/auth.guard";
 import { AdapterService } from "./adapter.service";
 import {
   AdapterImportBeliefsSnapshotRequest,
+  AdapterImportIntrospectionSummaryRequest,
   AdapterImportLogBatchRequest,
+  AdapterImportMemorySnapshotRequest,
+  AdapterImportStatusSnapshotRequest,
 } from "./adapter.types";
 import {
   DatabaseError,
@@ -46,6 +49,35 @@ export class AdapterController {
       return await this.adapter.importBeliefsSnapshot(dto);
     } catch (error) {
       throw this.mapHttpError(error, "Failed to import beliefs snapshot.");
+    }
+  }
+
+  @Post("import/memory-snapshot")
+  async importMemorySnapshot(@Body() dto: AdapterImportMemorySnapshotRequest) {
+    try {
+      return await this.adapter.importMemorySnapshot(dto);
+    } catch (error) {
+      throw this.mapHttpError(error, "Failed to import memory snapshot.");
+    }
+  }
+
+  @Post("import/status-snapshot")
+  async importStatusSnapshot(@Body() dto: AdapterImportStatusSnapshotRequest) {
+    try {
+      return await this.adapter.importStatusSnapshot(dto);
+    } catch (error) {
+      throw this.mapHttpError(error, "Failed to import status snapshot.");
+    }
+  }
+
+  @Post("import/introspection-summary")
+  async importIntrospectionSummary(
+    @Body() dto: AdapterImportIntrospectionSummaryRequest,
+  ) {
+    try {
+      return await this.adapter.importIntrospectionSummary(dto);
+    } catch (error) {
+      throw this.mapHttpError(error, "Failed to import introspection summary.");
     }
   }
 
