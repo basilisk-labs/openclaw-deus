@@ -2,7 +2,7 @@
 
 DEFINE TABLE adapter_import_cursor SCHEMAFULL;
 DEFINE FIELD key        ON adapter_import_cursor TYPE string ASSERT $value != NONE;
-DEFINE FIELD value      ON adapter_import_cursor TYPE object;
+DEFINE FIELD OVERWRITE value      ON adapter_import_cursor TYPE object FLEXIBLE;
 DEFINE FIELD updated_at ON adapter_import_cursor TYPE datetime;
 DEFINE INDEX idx_adapter_cursor_key ON adapter_import_cursor FIELDS key UNIQUE;
 
@@ -12,7 +12,7 @@ DEFINE FIELD batch_id       ON adapter_log_entry TYPE option<string>;
 DEFINE FIELD source_runtime ON adapter_log_entry TYPE string;
 DEFINE FIELD entry_type     ON adapter_log_entry TYPE string;
 DEFINE FIELD timestamp      ON adapter_log_entry TYPE option<datetime>;
-DEFINE FIELD payload        ON adapter_log_entry TYPE object;
+DEFINE FIELD OVERWRITE payload        ON adapter_log_entry TYPE object FLEXIBLE;
 DEFINE FIELD imported_at    ON adapter_log_entry TYPE datetime;
 DEFINE INDEX idx_adapter_log_source_id ON adapter_log_entry FIELDS source_id UNIQUE;
 
@@ -21,7 +21,7 @@ DEFINE FIELD snapshot_id    ON adapter_snapshot TYPE string ASSERT $value != NON
 DEFINE FIELD snapshot_type  ON adapter_snapshot TYPE string;
 DEFINE FIELD source_runtime ON adapter_snapshot TYPE string;
 DEFINE FIELD generated_at   ON adapter_snapshot TYPE datetime;
-DEFINE FIELD payload        ON adapter_snapshot TYPE object;
+DEFINE FIELD OVERWRITE payload        ON adapter_snapshot TYPE object FLEXIBLE;
 DEFINE FIELD imported_at    ON adapter_snapshot TYPE datetime;
 DEFINE INDEX idx_adapter_snapshot_id ON adapter_snapshot FIELDS snapshot_id UNIQUE;
 
