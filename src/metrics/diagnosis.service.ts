@@ -134,10 +134,8 @@ export class DiagnosisService {
   async analyze(
     snapshot: CognitiveSnapshot,
   ): Promise<Result<DiagnosisResult, DomainError>> {
-    const now = new Date().toISOString();
-
-    // Always run rule-based diagnosis
     const ruleDiagnoses = this.runRuleBasedDiagnosis(snapshot);
+    const now = new Date().toISOString();
 
     // If LLM available, run deep diagnosis
     let llmDiagnoses: Diagnosis[] = [];
@@ -160,22 +158,15 @@ export class DiagnosisService {
       diag.created_at = now;
     }
 
-    const result: DiagnosisResult = {
-      snapshot_id: snapshot.id || snapshot.timestamp,
-      diagnoses: merged,
-      summary:
-        merged.length > 0
-          ? `Found ${merged.length} issues: ${merged.map((d) => `${d.dimension}(${d.severity})`).join(", ")}`
-          : "No significant issues detected",
-      created_at: now,
-    };
+    return this.persistDiagnosisResult(snapshot, merged, now);
+  }
 
-    await this.db.create(
-      "diagnosis",
-      result as unknown as Record<string, unknown>,
-    );
-    this.logger.log(`Diagnosis: ${merged.length} issues found`);
-    return ok(result);
+  async analyzeRuleOnly(
+    snapshot: CognitiveSnapshot,
+  ): Promise<Result<DiagnosisResult, DomainError>> {
+    const now = new Date().toISOString();
+    const diagnoses = this.runRuleBasedDiagnosis(snapshot);
+    return this.persistDiagnosisResult(snapshot, diagnoses, now);
   }
 
   /**
@@ -576,5 +567,36 @@ Analyze these metrics and identify weaknesses. For each, determine if the root c
     }
 
     return Array.from(byDimension.values());
+  }
+
+  private async persistDiagnosisResult(
+    snapshot: CognitiveSnapshot,
+    diagnoses: Diagnosis[],
+    createdAt: string,
+  ): Promise<Result<DiagnosisResult, DomainError>> {
+    let hypIdx = 0;
+    for (const diagnosis of diagnoses) {
+      for (const hypothesis of diagnosis.hypotheses) {
+        hypothesis.id = `hyp_${Date.now()}_${hypIdx++}`;
+      }
+      diagnosis.created_at = createdAt;
+    }
+
+    const result: DiagnosisResult = {
+      snapshot_id: snapshot.id || snapshot.timestamp,
+      diagnoses,
+      summary:
+        diagnoses.length > 0
+          ? `Found ${diagnoses.length} issues: ${diagnoses.map((d) => `${d.dimension}(${d.severity})`).join(", ")}`
+          : "No significant issues detected",
+      created_at: createdAt,
+    };
+
+    await this.db.create(
+      "diagnosis",
+      result as unknown as Record<string, unknown>,
+    );
+    this.logger.log(`Diagnosis: ${diagnoses.length} issues found`);
+    return ok(result);
   }
 }

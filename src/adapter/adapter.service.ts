@@ -560,27 +560,23 @@ export class AdapterService {
   async getLatestDiagnosis(): Promise<AdapterDiagnosisLatestResponse> {
     let diagnosis = await this.readLatestDiagnosis();
     const latestImportAt = await this.readLatestAdapterImportTimestamp();
-    if (
-      !diagnosis ||
-      this.isReadModelStale(diagnosis.created_at, latestImportAt)
-    ) {
-      const metrics = await this.metrics.getLatest();
-      let snapshot = metrics.isOk() ? metrics.value : null;
-      if (
-        !snapshot ||
-        this.isReadModelStale(snapshot.timestamp, latestImportAt)
-      ) {
-        const fresh = await this.metrics.snapshot();
-        if (fresh.isErr()) {
-          throw fresh.error;
+    const stale =
+      !diagnosis || this.isReadModelStale(diagnosis.created_at, latestImportAt);
+    if (stale) {
+      const snapshot = await this.resolveLatestMetricsSnapshot(latestImportAt);
+      if (!diagnosis) {
+        const generated = await this.diagnosis.analyzeRuleOnly(snapshot);
+        if (generated.isErr()) {
+          throw generated.error;
         }
-        snapshot = fresh.value;
+        diagnosis = generated.value;
+      } else {
+        this.triggerAsyncDiagnosisRefresh(snapshot);
       }
-      const generated = await this.diagnosis.analyze(snapshot);
-      if (generated.isErr()) {
-        throw generated.error;
-      }
-      diagnosis = generated.value;
+    }
+
+    if (!diagnosis) {
+      throw new Error("Diagnosis read-model could not be prepared.");
     }
 
     return {
@@ -589,6 +585,37 @@ export class AdapterService {
       sourceFreshnessMs: this.getFreshnessMs(diagnosis.created_at),
       diagnosis,
     };
+  }
+
+  private async resolveLatestMetricsSnapshot(
+    latestImportAt: string | null,
+  ): Promise<CognitiveSnapshot> {
+    const metrics = await this.metrics.getLatest();
+    let snapshot = metrics.isOk() ? metrics.value : null;
+    if (
+      !snapshot ||
+      this.isReadModelStale(snapshot.timestamp, latestImportAt)
+    ) {
+      const fresh = await this.metrics.snapshot();
+      if (fresh.isErr()) {
+        throw fresh.error;
+      }
+      snapshot = fresh.value;
+    }
+    return snapshot;
+  }
+
+  private triggerAsyncDiagnosisRefresh(snapshot: CognitiveSnapshot): void {
+    setImmediate(() => {
+      this.diagnosis.analyze(snapshot).catch((error: unknown) => {
+        const message =
+          error instanceof Error ? error.message : String(error ?? "unknown");
+        // Keep read endpoints fast; live refresh failures stay advisory.
+        console.warn(
+          `[cognitive-runtime] async diagnosis refresh failed: ${message}`,
+        );
+      });
+    });
   }
 
   private async enrichWorldModelFromImports(

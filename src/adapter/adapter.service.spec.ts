@@ -130,6 +130,9 @@ describe("AdapterService", () => {
           provide: DiagnosisService,
           useValue: {
             analyze: jest.fn().mockResolvedValue(ok({ ...DIAGNOSIS_FIXTURE })),
+            analyzeRuleOnly: jest
+              .fn()
+              .mockResolvedValue(ok({ ...DIAGNOSIS_FIXTURE })),
           },
         },
       ],
@@ -450,7 +453,7 @@ describe("AdapterService", () => {
     expect(result.model.workspace_model.introspection_date).toBe("2026-03-27");
   });
 
-  it("refreshes stale metrics before generating diagnosis", async () => {
+  it("returns the cached diagnosis immediately and refreshes it asynchronously when stale", async () => {
     metrics.snapshot.mockResolvedValueOnce(
       ok({
         ...METRICS_FIXTURE,
@@ -479,6 +482,7 @@ describe("AdapterService", () => {
       .mockResolvedValueOnce(ok([]));
 
     const result = await service.getLatestDiagnosis();
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(metrics.snapshot).toHaveBeenCalled();
     expect(diagnosis.analyze).toHaveBeenCalledWith(
@@ -486,10 +490,10 @@ describe("AdapterService", () => {
         timestamp: "2026-03-27T09:01:00.000Z",
       }),
     );
-    expect(result.generatedAt).toBe("2026-03-27T09:02:00.000Z");
+    expect(result.generatedAt).toBe("2026-03-27T08:06:00.000Z");
   });
 
-  it("reads latest diagnosis and generates one on demand when missing", async () => {
+  it("builds a fast rule-only diagnosis when none exists yet", async () => {
     db.query
       .mockResolvedValueOnce(ok([]))
       .mockResolvedValueOnce(ok([]))
@@ -499,6 +503,7 @@ describe("AdapterService", () => {
     const result = await service.getLatestDiagnosis();
     expect(result.ok).toBe(true);
     expect(result.diagnosis.summary).toBe("No significant issues detected");
-    expect(diagnosis.analyze).toHaveBeenCalled();
+    expect(diagnosis.analyzeRuleOnly).toHaveBeenCalled();
+    expect(diagnosis.analyze).not.toHaveBeenCalled();
   });
 });
