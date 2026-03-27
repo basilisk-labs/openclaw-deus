@@ -112,7 +112,7 @@ export default (): DeusConfig => ({
     gatewayTimeoutMs: parseInt(
       process.env.OPENCLAW_INFERENCE_GATEWAY_TIMEOUT_MS ||
         process.env.OPENCLAW_GATEWAY_TIMEOUT_MS ||
-        "15000",
+        "30000",
       10,
     ),
   },
