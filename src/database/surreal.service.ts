@@ -21,6 +21,7 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
   private connected = false;
   private config: SurrealConfig;
   private liveQueries: string[] = [];
+  private reconnectingPromise: Promise<void> | null = null;
 
   constructor(@Optional() private readonly configService?: ConfigService) {
     this.db = new Surreal();
@@ -116,7 +117,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     vars?: Record<string, unknown>,
   ): Promise<Result<T[], DatabaseError>> {
     try {
-      const results = await this.db.query<T[][]>(sql, vars);
+      const results = await this.withAuthRetry(`query:${sql}`, () =>
+        this.db.query<T[][]>(sql, vars),
+      );
       const data =
         Array.isArray(results) && results.length > 0
           ? ((Array.isArray(results[0]) ? results[0] : [results[0]]) as T[])
@@ -133,7 +136,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     vars?: Record<string, unknown>,
   ): Promise<Result<T, DatabaseError>> {
     try {
-      const results = await this.db.query<T[]>(sql, vars);
+      const results = await this.withAuthRetry(`queryRaw:${sql}`, () =>
+        this.db.query<T[]>(sql, vars),
+      );
       return ok(results as unknown as T);
     } catch (error) {
       this.logger.error(`Query failed: ${sql} — ${error}`);
@@ -146,7 +151,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     vars?: Record<string, unknown>,
   ): Promise<Result<unknown, DatabaseError>> {
     try {
-      const result = await this.db.query(sql, vars);
+      const result = await this.withAuthRetry(`execute:${sql}`, () =>
+        this.db.query(sql, vars),
+      );
       return ok(result);
     } catch (error) {
       return err(new DatabaseError(`Execute failed: ${error}`, error));
@@ -155,7 +162,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
 
   async select<T>(table: string): Promise<Result<T[], DatabaseError>> {
     try {
-      const results = (await this.db.select(table)) as unknown as T[];
+      const results = (await this.withAuthRetry(`select:${table}`, () =>
+        this.db.select(table),
+      )) as unknown as T[];
       return ok(Array.isArray(results) ? results : [results]);
     } catch (error) {
       return err(
@@ -167,9 +176,11 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
   async create<T>(table: string, data: T): Promise<Result<T, DatabaseError>> {
     try {
       // SurrealDB SDK expects loosely typed data for create/merge operations
-      const result = await this.db.create(
-        table,
-        this.coerceDatetimes(data) as Record<string, unknown>,
+      const result = await this.withAuthRetry(`create:${table}`, () =>
+        this.db.create(
+          table,
+          this.coerceDatetimes(data) as Record<string, unknown>,
+        ),
       );
       const record = Array.isArray(result) ? result[0] : result;
       return ok(record as unknown as T);
@@ -185,9 +196,11 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     data: Partial<T>,
   ): Promise<Result<T, DatabaseError>> {
     try {
-      const result = await this.db.merge(
-        id,
-        this.coerceDatetimes(data) as Record<string, unknown>,
+      const result = await this.withAuthRetry(`update:${id}`, () =>
+        this.db.merge(
+          id,
+          this.coerceDatetimes(data) as Record<string, unknown>,
+        ),
       );
       return ok(result as unknown as T);
     } catch (error) {
@@ -200,7 +213,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     vars?: Record<string, unknown>,
   ): Promise<Result<number, DatabaseError>> {
     try {
-      const results = await this.db.query(sql, vars);
+      const results = await this.withAuthRetry(`batchUpdate:${sql}`, () =>
+        this.db.query(sql, vars),
+      );
       const arr =
         Array.isArray(results) && results.length > 0 ? results[0] : [];
       return ok(Array.isArray(arr) ? arr.length : 0);
@@ -211,7 +226,7 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
 
   async remove(id: string): Promise<Result<void, DatabaseError>> {
     try {
-      await this.db.delete(id);
+      await this.withAuthRetry(`remove:${id}`, () => this.db.delete(id));
       return ok(undefined);
     } catch (error) {
       return err(new DatabaseError(`Delete ${id} failed: ${error}`, error));
@@ -252,14 +267,16 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
     callback: (data: any) => void,
   ): Promise<Result<string, DatabaseError>> {
     try {
-      const queryUuid = await this.db.live(table, (action, result) => {
-        callback({
-          action,
-          result,
-          table,
-          timestamp: new Date().toISOString(),
-        });
-      });
+      const queryUuid = await this.withAuthRetry(`live:${table}`, () =>
+        this.db.live(table, (action, result) => {
+          callback({
+            action,
+            result,
+            table,
+            timestamp: new Date().toISOString(),
+          });
+        }),
+      );
       const id = String(queryUuid);
       this.liveQueries.push(id);
       this.logger.log(`LIVE SELECT on ${table} started (${id})`);
@@ -273,7 +290,9 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
 
   async killLive(queryId: string): Promise<Result<void, DatabaseError>> {
     try {
-      await this.db.query(`KILL $id`, { id: queryId });
+      await this.withAuthRetry(`killLive:${queryId}`, () =>
+        this.db.query(`KILL $id`, { id: queryId }),
+      );
       this.liveQueries = this.liveQueries.filter((id) => id !== queryId);
       return ok(undefined);
     } catch (error) {
@@ -346,11 +365,87 @@ export class SurrealService implements OnModuleInit, OnModuleDestroy {
 
   async ping(): Promise<Result<boolean, DatabaseError>> {
     try {
-      await this.db.query("RETURN true");
+      await this.withAuthRetry("ping", () => this.db.query("RETURN true"));
       return ok(true);
     } catch (error) {
       return err(new DatabaseError(`Ping failed: ${error}`, error));
     }
+  }
+
+  private async withAuthRetry<T>(
+    label: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!this.isRecoverableAuthError(error)) {
+        throw error;
+      }
+
+      this.logger.warn(
+        `${label} failed with an expired SurrealDB auth token; refreshing session`,
+      );
+      await this.refreshAuthSession();
+      return operation();
+    }
+  }
+
+  private isRecoverableAuthError(error: unknown): boolean {
+    const message = this.formatErrorMessage(error).toLowerCase();
+    return (
+      message.includes("token has expired") ||
+      message.includes("token expired") ||
+      message.includes("session has expired") ||
+      message.includes("jwt") ||
+      message.includes("auth token")
+    );
+  }
+
+  private async refreshAuthSession(): Promise<void> {
+    if (this.reconnectingPromise) {
+      await this.reconnectingPromise;
+      return;
+    }
+
+    this.reconnectingPromise = (async () => {
+      this.connected = false;
+
+      try {
+        await this.db.signin({
+          username: this.config.username,
+          password: this.config.password,
+        });
+        await this.db.use({
+          namespace: this.config.namespace,
+          database: this.config.database,
+        });
+        this.connected = true;
+        this.logger.warn("Refreshed SurrealDB auth session");
+        return;
+      } catch (refreshError) {
+        this.logger.warn(
+          `SurrealDB session refresh failed; reconnecting: ${this.formatErrorMessage(refreshError)}`,
+        );
+      }
+
+      try {
+        await this.db.close();
+      } catch {}
+
+      this.db = new Surreal();
+      await this.connect();
+    })();
+
+    try {
+      await this.reconnectingPromise;
+    } finally {
+      this.reconnectingPromise = null;
+    }
+  }
+
+  private formatErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   /**
